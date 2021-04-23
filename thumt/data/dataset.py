@@ -1,395 +1,667 @@
 # coding=utf-8
-# Copyright 2017-2019 The THUMT Authors
+# Copyright 2017-Present The THUMT Authors
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+import abc
+import torch
 
-import math
-import operator
+from collections.abc import Sequence
+from torch.utils.data import IterableDataset
+from thumt.data.iterator import Iterator
+from thumt.data.vocab import Vocabulary
+from thumt.tokenizers import Tokenizer
+from typing import Any, Dict, NoReturn, List, Tuple, Union, Callable
 
-import tensorflow as tf
-import thumt.utils.distribute as distribute
+
+class ElementSpec(object):
+
+    def __init__(self, elem_type, shape):
+        self._type = elem_type
+        self._shape = shape
+
+    def __repr__(self) -> str:
+        return "%s, %s" % (self._type, self._shape)
+
+    @property
+    def elem_type(self) -> Any:
+        return self._type
+
+    @property
+    def shape(self) -> str:
+        return self._shape
 
 
-def batch_examples(example, batch_size, max_length, mantissa_bits,
-                   shard_multiplier=1, length_multiplier=1, constant=False,
-                   num_threads=4, drop_long_sequences=True):
-    """ Batch examples
+class MapFunc(object):
 
-    :param example: A dictionary of <feature name, Tensor>.
-    :param batch_size: The number of tokens or sentences in a batch
-    :param max_length: The maximum length of a example to keep
-    :param mantissa_bits: An integer
-    :param shard_multiplier: an integer increasing the batch_size to suit
-        splitting across data shards.
-    :param length_multiplier: an integer multiplier that is used to
-        increase the batch sizes and sequence length tolerance.
-    :param constant: Whether to use constant batch size
-    :param num_threads: Number of threads
-    :param drop_long_sequences: Whether to drop long sequences
+    def __init__(self, fn: Callable, spec: ElementSpec):
+        self._fn = fn
+        self._elem_spec = spec
 
-    :returns: A dictionary of batched examples
-    """
+    def __call__(self, *args, **kwargs) -> Any:
+        return self._fn(*args, **kwargs)
 
-    with tf.name_scope("batch_examples"):
-        max_length = max_length or batch_size
-        min_length = 8
-        mantissa_bits = mantissa_bits
+    @property
+    def function(self):
+        return self._fn
 
-        # Compute boundaries
-        x = min_length
-        boundaries = []
+    @property
+    def element_spec(self):
+        return self._elem_spec
 
-        while x < max_length:
-            boundaries.append(x)
-            x += 2 ** max(0, int(math.log(x, 2)) - mantissa_bits)
 
-        # Whether the batch size is constant
-        if not constant:
-            batch_sizes = [max(1, batch_size // length)
-                           for length in boundaries + [max_length]]
-            batch_sizes = [b * shard_multiplier for b in batch_sizes]
-            bucket_capacities = [2 * b for b in batch_sizes]
+class Dataset(IterableDataset):
+
+    def __init__(self):
+        self._iterator = None
+
+    def __iter__(self) -> Iterator:
+        return Iterator(self)
+
+    @abc.abstractproperty
+    def _inputs(self) -> NoReturn:
+        raise NotImplementedError("Not implemented.")
+
+    @abc.abstractmethod
+    def copy(self) -> NoReturn:
+        raise NotImplementedError("Dataset.copy not implemented.")
+
+    @abc.abstractproperty
+    def element_spec(self) -> NoReturn:
+        raise NotImplementedError("Dataset.element_spec not implemented.")
+
+    @property
+    def name(self) -> str:
+        return "Dataset"
+
+    def new_iterator(self) -> Iterator:
+        return Iterator(self)
+
+    def background(self) -> "BackgroundDataset":
+        return BackgroundDataset(self)
+
+    def map(self, fn: MapFunc) -> "MapDataset":
+        return MapDataset(self, fn)
+
+    def padded_batch(self, batch_size: int, pad: int) -> "PaddedBatchDataset":
+        return PaddedBatchDataset(self, batch_size, pad)
+
+    def repeat(self, n: int) -> "RepeatDataset":
+        return RepeatDataset(self, n)
+
+    def shard(self, num_shards: int, index: int) -> "ShardDataset":
+        return ShardDataset(self, num_shards, index)
+
+    @abc.abstractmethod
+    def set_inputs(self, datasets: Tuple["Dataset"]) -> NoReturn:
+        raise NotImplementedError("Dataset.set_inputs not implemented.")
+
+    def tokenize(self, tokenizer: Tokenizer, bos: bytes = b"<bos>",
+                 eos: bytes = b"<eos>") -> "TokenizedLineDataset":
+        return TokenizedLineDataset(self, tokenizer, bos, eos)
+
+    @staticmethod
+    def bucket_by_sequence_length(dataset: "Dataset",
+                                  bucket_boundaries: List[int],
+                                  batch_sizes: List[int],
+                                  pad: int = 0,
+                                  min_length: int = -1,
+                                  max_length: int = 10000) -> "BucketDataset":
+        return BucketDataset(dataset, bucket_boundaries, batch_sizes, pad,
+                             min_length, max_length)
+
+    @staticmethod
+    def lookup(dataset: "Dataset", vocabulary: Dict[bytes, int], unk_id):
+        return LookupDataset(dataset, vocabulary, unk_id)
+
+    @staticmethod
+    def zip(datasets: Tuple["Dataset"]) -> "ZipDataset":
+        return ZipDataset(datasets)
+
+
+class DatasetSource(Dataset):
+
+    def _inputs(self):
+        return []
+
+
+class BackgroundDataset(Dataset):
+
+    def __init__(self, dataset: Dataset):
+        self._dataset = dataset
+
+        super(BackgroundDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<BackgroundDataset:%s>" % self._dataset
+
+    def _inputs(self):
+        return [self._dataset]
+
+    @property
+    def name(self):
+        return "BackgroundDataset"
+
+    @property
+    def element_spec(self):
+        return self._dataset._spec
+
+
+class BucketDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, bucket_boundaries : List[int],
+                 batch_sizes: List[int], pad: int = 0, min_length: int = -1,
+                 max_length: int = 10000):
+        if not self._check_type(dataset.element_spec):
+            raise ValueError("The input dataset must produces an example of "
+                             "`List[int]` or `Tuple[List[int], ...]`")
+
+        self._dataset = dataset
+        self._pad = pad
+        self._bucket_boundaries = bucket_boundaries
+        self._batch_sizes = batch_sizes
+        self._min_length = min_length
+        self._max_length = max_length
+
+        _elem_spec = self._dataset.element_spec
+
+        if _elem_spec.elem_type is List[int]:
+            _elem_type = List[List[int]]
+            _elem_shape = "[None, None]"
         else:
-            batch_sizes = batch_size * shard_multiplier
-            bucket_capacities = [2 * n for n in boundaries + [max_length]]
-
-        max_length *= length_multiplier
-        boundaries = [boundary * length_multiplier for boundary in boundaries]
-        max_length = max_length if drop_long_sequences else 10 ** 9
-
-        # The queue to bucket on will be chosen based on maximum length
-        max_example_length = 0
-        for v in example.values():
-            if v.shape.ndims > 0:
-                seq_length = tf.shape(v)[0]
-                max_example_length = tf.maximum(max_example_length, seq_length)
-
-        (_, outputs) = tf.contrib.training.bucket_by_sequence_length(
-            max_example_length,
-            example,
-            batch_sizes,
-            [b + 1 for b in boundaries],
-            num_threads=num_threads,
-            capacity=2,  # Number of full batches to store, we don't need many.
-            bucket_capacities=bucket_capacities,
-            dynamic_pad=True,
-            keep_input=(max_example_length <= max_length)
-        )
-
-    return outputs
-
-
-def get_training_input(filenames, params):
-    """ Get input for training stage
-
-    :param filenames: A list contains [source_filenames, target_filenames]
-    :param params: Hyper-parameters
-
-    :returns: A dictionary of pair <Key, Tensor>
-    """
-
-    with tf.device("/cpu:0"):
-        src_dataset = tf.data.TextLineDataset(filenames[0])
-        tgt_dataset = tf.data.TextLineDataset(filenames[1])
-
-        dataset = tf.data.Dataset.zip((src_dataset, tgt_dataset))
-
-        if distribute.is_distributed_training_mode():
-            dataset = dataset.shard(distribute.size(), distribute.rank())
-
-        dataset = dataset.shuffle(params.buffer_size)
-        dataset = dataset.repeat()
-
-        # Split string
-        dataset = dataset.map(
-            lambda src, tgt: (
-                tf.string_split([src]).values,
-                tf.string_split([tgt]).values
-            ),
-            num_parallel_calls=params.num_threads
-        )
-
-        # Append <eos> symbol
-        dataset = dataset.map(
-            lambda src, tgt: (
-                tf.concat([src, [tf.constant(params.eos)]], axis=0),
-                tf.concat([tgt, [tf.constant(params.eos)]], axis=0)
-            ),
-            num_parallel_calls=params.num_threads
-        )
-
-        # Convert to dictionary
-        dataset = dataset.map(
-            lambda src, tgt: {
-                "source": src,
-                "target": tgt,
-                "source_length": tf.shape(src),
-                "target_length": tf.shape(tgt)
-            },
-            num_parallel_calls=params.num_threads
-        )
-
-        # Create iterator
-        iterator = dataset.make_one_shot_iterator()
-        features = iterator.get_next()
-
-        # Create lookup table
-        src_table = tf.contrib.lookup.index_table_from_tensor(
-            tf.constant(params.vocabulary["source"]),
-            default_value=params.mapping["source"][params.unk]
-        )
-        tgt_table = tf.contrib.lookup.index_table_from_tensor(
-            tf.constant(params.vocabulary["target"]),
-            default_value=params.mapping["target"][params.unk]
-        )
-
-        # String to index lookup
-        features["source"] = src_table.lookup(features["source"])
-        features["target"] = tgt_table.lookup(features["target"])
-
-        # Batching
-        features = batch_examples(features, params.batch_size,
-                                  params.max_length, params.mantissa_bits,
-                                  shard_multiplier=len(params.device_list),
-                                  length_multiplier=params.length_multiplier,
-                                  constant=params.constant_batch_size,
-                                  num_threads=params.num_threads)
-
-        # Convert to int32
-        features["source"] = tf.to_int32(features["source"])
-        features["target"] = tf.to_int32(features["target"])
-        features["source_length"] = tf.to_int32(features["source_length"])
-        features["target_length"] = tf.to_int32(features["target_length"])
-        features["source_length"] = tf.squeeze(features["source_length"], 1)
-        features["target_length"] = tf.squeeze(features["target_length"], 1)
-
-        return features
-
-
-def sort_input_file(filename, reverse=True):
-    # Read file
-    with tf.gfile.Open(filename) as fd:
-        inputs = [line.strip() for line in fd]
-
-    input_lens = [
-        (i, len(line.strip().split())) for i, line in enumerate(inputs)
-    ]
-
-    sorted_input_lens = sorted(input_lens, key=operator.itemgetter(1),
-                               reverse=reverse)
-    sorted_keys = {}
-    sorted_inputs = []
-
-    for i, (index, _) in enumerate(sorted_input_lens):
-        sorted_inputs.append(inputs[index])
-        sorted_keys[index] = i
-
-    return sorted_keys, sorted_inputs
-
-
-def sort_and_zip_files(names):
-    inputs = []
-    input_lens = []
-    files = [tf.gfile.GFile(name) for name in names]
-
-    count = 0
-
-    for lines in zip(*files):
-        lines = [line.strip() for line in lines]
-        input_lens.append((count, len(lines[0].split())))
-        inputs.append(lines)
-        count += 1
-
-    # Close files
-    for fd in files:
-        fd.close()
-
-    sorted_input_lens = sorted(input_lens, key=operator.itemgetter(1),
-                               reverse=True)
-    sorted_inputs = []
-
-    for i, (index, _) in enumerate(sorted_input_lens):
-        sorted_inputs.append(inputs[index])
-
-    return [list(x) for x in zip(*sorted_inputs)]
-
-
-def get_evaluation_input(inputs, params):
-    with tf.device("/cpu:0"):
-        # Create datasets
-        datasets = []
-
-        for data in inputs:
-            dataset = tf.data.Dataset.from_tensor_slices(data)
-            # Split string
-            dataset = dataset.map(lambda x: tf.string_split([x]).values,
-                                  num_parallel_calls=params.num_threads)
-            # Append <eos>
-            dataset = dataset.map(
-                lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
-                num_parallel_calls=params.num_threads
-            )
-            datasets.append(dataset)
-
-        dataset = tf.data.Dataset.zip(tuple(datasets))
-
-        # Convert tuple to dictionary
-        dataset = dataset.map(
-            lambda *x: {
-                "source": x[0],
-                "source_length": tf.shape(x[0])[0],
-                "references": x[1:]
-            },
-            num_parallel_calls=params.num_threads
-        )
-
-        dataset = dataset.padded_batch(
-            params.eval_batch_size * len(params.device_list),
-            {
-                "source": [tf.Dimension(None)],
-                "source_length": [],
-                "references": (tf.Dimension(None),) * (len(inputs) - 1)
-            },
-            {
-                "source": params.pad,
-                "source_length": 0,
-                "references": (params.pad,) * (len(inputs) - 1)
-            }
-        )
-
-        iterator = dataset.make_one_shot_iterator()
-        features = iterator.get_next()
-
-        # Covert source symbols to ids
-        src_table = tf.contrib.lookup.index_table_from_tensor(
-            tf.constant(params.vocabulary["source"]),
-            default_value=params.mapping["source"][params.unk]
-        )
-
-        features["source"] = src_table.lookup(features["source"])
-
-    return features
-
-
-def get_inference_input(inputs, params):
-    if params.generate_samples:
-        batch_size = params.sample_batch_size
-    else:
-        batch_size = params.decode_batch_size
-
-    with tf.device("/cpu:0"):
-        dataset = tf.data.Dataset.from_tensor_slices(
-            tf.constant(inputs)
-        )
-
-        # Split string
-        dataset = dataset.map(lambda x: tf.string_split([x]).values,
-                              num_parallel_calls=params.num_threads)
-
-        # Append <eos>
-        dataset = dataset.map(
-            lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
-            num_parallel_calls=params.num_threads
-        )
-
-        # Convert tuple to dictionary
-        dataset = dataset.map(
-            lambda x: {"source": x, "source_length": tf.shape(x)[0]},
-            num_parallel_calls=params.num_threads
-        )
-
-        dataset = dataset.padded_batch(
-            batch_size * len(params.device_list),
-            {"source": [tf.Dimension(None)], "source_length": []},
-            {"source": params.pad, "source_length": 0}
-        )
-
-        iterator = dataset.make_one_shot_iterator()
-        features = iterator.get_next()
-
-        src_table = tf.contrib.lookup.index_table_from_tensor(
-            tf.constant(params.vocabulary["source"]),
-            default_value=params.mapping["source"][params.unk]
-        )
-        features["source"] = src_table.lookup(features["source"])
-
-        return features
-
-
-def get_relevance_input(inputs, outputs, params):
-    # inputs
-    dataset = tf.data.Dataset.from_tensor_slices(
-        tf.constant(inputs)
-    )
-
-    # Split string
-    dataset = dataset.map(lambda x: tf.string_split([x]).values,
-                          num_parallel_calls=params.num_threads)
-
-    # Append <eos>
-    dataset = dataset.map(
-        lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
-        num_parallel_calls=params.num_threads
-    )
-
-    # Convert tuple to dictionary
-    dataset = dataset.map(
-        lambda x: {"source": x, "source_length": tf.shape(x)[0]},
-        num_parallel_calls=params.num_threads
-    )
-
-    dataset = dataset.padded_batch(
-        params.decode_batch_size,
-        {"source": [tf.Dimension(None)], "source_length": []},
-        {"source": params.pad, "source_length": 0}
-    )
-
-    iterator = dataset.make_one_shot_iterator()
-    features = iterator.get_next()
-
-    src_table = tf.contrib.lookup.index_table_from_tensor(
-        tf.constant(params.vocabulary["source"]),
-        default_value=params.mapping["source"][params.unk]
-    )
-    features["source"] = src_table.lookup(features["source"])
-
-    # outputs
-    dataset_o = tf.data.Dataset.from_tensor_slices(
-        tf.constant(outputs)
-    )
-
-    # Split string
-    dataset_o = dataset_o.map(lambda x: tf.string_split([x]).values,
-                              num_parallel_calls=params.num_threads)
-
-    # Append <eos>
-    dataset_o = dataset_o.map(
-        lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
-        num_parallel_calls=params.num_threads
-    )
-
-    # Convert tuple to dictionary
-    dataset_o = dataset_o.map(
-        lambda x: {"target": x, "target_length": tf.shape(x)[0]},
-        num_parallel_calls=params.num_threads
-    )
-
-    dataset_o = dataset_o.padded_batch(
-        params.decode_batch_size,
-        {"target": [tf.Dimension(None)], "target_length": []},
-        {"target": params.pad, "target_length": 0}
-    )
-
-    iterator = dataset_o.make_one_shot_iterator()
-    features_o = iterator.get_next()
-
-    src_table = tf.contrib.lookup.index_table_from_tensor(
-        tf.constant(params.vocabulary["target"]),
-        default_value=params.mapping["target"][params.unk]
-    )
-    features["target"] = src_table.lookup(features_o["target"])
-    features["target_length"] = features_o["target_length"]
-
-    return features
+            # Tuple[List[int], ...] -> Tuple[List[List[int]], ...]
+            args = _elem_spec.elem_type.__args__
+            args = [List[t] for t in args]
+            _elem_type = Tuple[tuple(args)]
+            _elem_shape = ",".join(["[None, None]" for _ in args])
+
+            if len(args) == 1:
+                _elem_shape = "(" + _elem_shape + ",)"
+            else:
+                _elem_shape = "(" + _elem_shape + ")"
+
+        self._spec = ElementSpec(_elem_type, _elem_shape)
+
+        super(BucketDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<BucketDataset:%s>" % self._dataset
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def _check_type(self, elem_spec) -> bool:
+        if elem_spec.elem_type is List[int]:
+            return True
+        elif not isinstance(elem_spec.elem_type,
+                            type(Tuple[List[int], ...])):
+            return False
+        else:
+            args = elem_spec.elem_type.__args__
+
+            if len(args) == 0:
+                return False
+
+            for t in args:
+                if t is not List[int]:
+                    return False
+
+            return True
+
+    def copy(self) -> "BucketDataset":
+        return BucketDataset(self._dataset.copy(), self._bucket_boundaries,
+                             self._batch_sizes, self._pad)
+
+    @property
+    def name(self):
+        return "BucketDataset"
+
+    @property
+    def bucket_boundaries(self) -> List[int]:
+        return self._bucket_boundaries
+
+    @property
+    def batch_sizes(self) -> List[int]:
+        return self._batch_sizes
+
+    @property
+    def min_length(self) -> int:
+        return self._min_length
+
+    @property
+    def max_length(self) -> int:
+        return self._max_length
+
+    @property
+    def pad(self) -> bytes:
+        return self._pad
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        dataset = datasets[0]
+
+        if not self._check_type(dataset.element_spec):
+            raise ValueError("The input dataset must produces an example of "
+                             "`List[int]` or `Tuple[List[int], ...]`")
+
+        self._dataset = dataset
+
+        _elem_spec = self._dataset.element_spec
+
+        if _elem_spec.elem_type is List[int]:
+            _elem_type = List[List[int]]
+            _elem_shape = "[None, None]"
+        else:
+            # Tuple[List[int], ...] -> Tuple[List[List[int]], ...]
+            args = _elem_spec.elem_type.__args__
+            args = [List[t] for t in args]
+            _elem_type = Tuple[tuple(args)]
+            _elem_shape = ",".join(["[None, None]" for _ in args])
+
+            if len(args) == 1:
+                _elem_shape = "(" + _elem_shape + ",)"
+            else:
+                _elem_shape = "(" + _elem_shape + ")"
+
+        self._spec = ElementSpec(_elem_type, _elem_shape)
+
+
+class FilterDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, min_len: int, max_len: int):
+        if dataset.element_spec.elem_type is not List[int]:
+            raise ValueError("The input dataset must produces an example of "
+                             "`List[int]`.")
+
+        self._dataset = dataset
+        self._min_len = min_len
+        self._max_len = max_len
+
+        super(FilterDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<FilterDataset:%s>" % self._dataset
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "FilterDataset":
+        return FilterDataset(self._dataset.copy(), self._min_len,
+                             self._max_len)
+
+    @property
+    def name(self) -> str:
+        return "FilterDataset"
+
+    @property
+    def max_len(self) -> int:
+        return self._max_len
+
+    @property
+    def min_len(self) -> int:
+        return self._min_len
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._dataset._spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        self._dataset = datasets[0]
+
+
+class LookupDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, vocabulary: Vocabulary,
+                 unk_id : int = -1):
+        if dataset.element_spec.elem_type is not List[bytes]:
+            raise ValueError("The input dataset must produces an example of "
+                             "`List[bytes]`.")
+        self._dataset = dataset
+        self._vocab = vocabulary
+        self._unk_id = unk_id
+        self._spec = ElementSpec(List[int], "[None]")
+        super(LookupDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<LookupDataset:%s>" % self._dataset
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "LookupDataset":
+        return LookupDataset(self._dataset.copy(), self._vocab, self._unk_id)
+
+    @property
+    def name(self) -> str:
+        return "LookupDataset"
+
+    @property
+    def unk_id(self) -> int:
+        return self._unk_id
+
+    @property
+    def vocabulary(self) -> Vocabulary:
+        return self._vocab
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        self._dataset = datasets[0]
+
+
+class MapDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, fn: MapFunc):
+        if not isinstance(fn, MapFunc):
+            raise ValueError("fn must be an instance of MapFunc.")
+
+        self._dataset = dataset
+        self._fn = fn
+        self._spec = fn.element_spec
+
+        super(MapDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<MapDataset:%s>" % str(self._dataset)
+
+    def copy(self) -> "MapDataset":
+        return MapDataset(self._dataset, self._fn)
+
+    @property
+    def name(self) -> str:
+        return "MapDataset"
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+
+class PaddedBatchDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, batch_size: int, pad: int):
+        self._dataset = dataset
+        self._batch_size = batch_size
+        self._pad = pad
+
+        _elem_spec = self._dataset.element_spec
+
+        if _elem_spec.elem_type is List[int]:
+            _elem_type = List[List[int]]
+            _elem_shape = "[None, None]"
+        else:
+            # Tuple[List[int], ...] -> Tuple[List[List[int]], ...]
+            args = _elem_spec.elem_type.__args__
+            args = [List[t] for t in args]
+            _elem_type = Tuple[tuple(args)]
+            _elem_shape = ",".join(["[None, None]" for _ in args])
+
+            if len(args) == 1:
+                _elem_shape = "(" + _elem_shape + ",)"
+            else:
+                _elem_shape = "(" + _elem_shape + ")"
+
+        self._spec = ElementSpec(_elem_type, _elem_shape)
+
+        super(PaddedBatchDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<PaddedDataset:%s>" % str(self._dataset)
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "PaddedDataset":
+        return PaddedBatchDataset(self._dataset.copy(),
+                                  self._batch_size, self._pad_id)
+
+    @property
+    def name(self) -> str:
+        return "PaddedBatchDataset"
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    @property
+    def pad(self) -> int:
+        return self._pad
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+
+class RepeatDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, count: int = None):
+        self._dataset = dataset
+        self._count = -1 if count is None else count
+        super(RepeatDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<RepeatDataset:%s,%d>" % (self._dataset, self._count)
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "RepeatDataset":
+        return RepeatDataset(self._dataset.copy(), self._count)
+
+    @property
+    def name(self) -> str:
+        return "RepeatDataset"
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        self._dataset.element_spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        self._dataset = datasets[0]
+
+
+class ShardDataset(Dataset):
+
+    def __init__(self, dataset: Dataset, num_shards : int, index : int):
+        self._dataset = dataset
+        self._num_shards = num_shards
+        self._index = index
+        super(ShardDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        info = (self._dataset, self._num_shards, self._index)
+        return "<ShardDataset:%s,%d,%d>" % info
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "ShardDataset":
+        return ShardDataset(self._dataset.copy(), self._num_shards,
+                            self._index)
+
+    @property
+    def name(self) -> str:
+        return "ShardDataset"
+
+    @property
+    def num_shards(self) -> int:
+        return self._num_shards
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._dataset.element_spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        self._dataset = datasets[0]
+
+
+class TextLineDataset(DatasetSource):
+
+    def __init__(self, buffer_or_filename: Union[List, str]):
+        self._source = buffer_or_filename
+        self._spec = ElementSpec(bytes, "[]")
+        super(TextLineDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<TextLineDataset:%s>" % self._filename
+
+    def copy(self) -> "TextLineDataset":
+        return TextLineDataset(self._source)
+
+    @property
+    def name(self) -> str:
+        return "TextLineDataset"
+
+    @property
+    def input_source(self) -> Union[List, str]:
+        return self._source
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        return None
+
+
+class TokenizedLineDataset(Dataset):
+
+    def __init__(self, dataset: TextLineDataset, tokenizer: Tokenizer,
+                 bos: bytes = b"<bos>", eos: bytes = b"<eos>"):
+        elem_spec = dataset.element_spec
+
+        if elem_spec.elem_type is not bytes or elem_spec.shape != "[]":
+            raise ValueError("TokenizedLineDataset only accepts a dataset with"
+                              " ElementSpec(bytes, '[None]')")
+
+        self._dataset = dataset
+        self._tokenizer = tokenizer
+        self._bos = bos
+        self._eos = eos
+        self._spec = ElementSpec(List[bytes], "[None]")
+        super(TokenizedLineDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        return "<TokenizedLineDataset:%s>" % self._dataset
+
+    def _inputs(self) -> List[Dataset]:
+        return [self._dataset]
+
+    def copy(self) -> "TokenizedLineDataset":
+        return TokenizedLineDataset(self._dataset.copy(), self._tokenizer,
+                                    self._bos, self._eos)
+
+    @property
+    def name(self) -> str:
+        return "TokenizedLineDataset"
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+    @property
+    def tokenizer(self) -> Tokenizer:
+        return self._tokenizer
+
+    @property
+    def bos(self) -> bytes:
+        return self._bos
+
+    @property
+    def eos(self) -> bytes:
+        return self._eos
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        if len(datasets) != 1:
+            raise ValueError("``datasets'' must be a tuple with one dataset.")
+
+        self._dataset = datasets[0]
+
+
+class ZipDataset(Dataset):
+
+    def __init__(self, datasets: Tuple[Dataset]):
+        if not isinstance(datasets, tuple):
+            raise ValueError("ZipDataset expects a tuple of datasets as "
+                             "the input.")
+
+        self._datasets = datasets
+        self._num_inputs = len(datasets)
+
+        _type = tuple(dataset.element_spec.elem_type for dataset in datasets)
+        _type = Tuple[_type]
+        _shape = ",".join([dataset.element_spec.shape for dataset in datasets])
+
+        if len(self._datasets) == 1:
+            _shape = "(" + _shape + ",)"
+        else:
+            _shape = "(" + _shape + ",)"
+
+        self._spec = ElementSpec(_type, _shape)
+
+        super(ZipDataset, self).__init__()
+
+    def __repr__(self) -> str:
+        if len(self._datasets == 1):
+            ds_repr = "(%s,)" % self._datasets[0]
+        else:
+            ds_repr = ",".join([str(ds) for ds in self._datasets])
+        return "<ZipDataset:(%s,)>" % ds_repr
+
+    def _inputs(self) -> List[Dataset]:
+        return list(self._datasets)
+
+    def copy(self) -> "ZipDataset":
+        datasets = tuple([ds.copy() for ds in self._datasets])
+        return ZipDataset(datasets)
+
+    @property
+    def name(self) -> str:
+        return "ZipDataset"
+
+    @property
+    def num_inputs(self) -> int:
+        return self._num_inputs
+
+    @property
+    def element_spec(self) -> ElementSpec:
+        return self._spec
+
+    def set_inputs(self, datasets: Tuple[Dataset]) -> None:
+        self._datasets = datasets
+
+        _type = tuple(dataset.element_spec.elem_type for dataset in datasets)
+        _type = Tuple[_type]
+        _shape = ",".join([dataset.element_spec.shape for dataset in datasets])
+
+        if len(self._datasets) == 1:
+            _shape = "(" + _shape + ",)"
+        else:
+            _shape = "(" + _shape + ",)"
+
+        self._spec = ElementSpec(_type, _shape)

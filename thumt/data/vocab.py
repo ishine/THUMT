@@ -1,36 +1,45 @@
 # coding=utf-8
-# Copyright 2017-2019 The THUMT Authors
+# Copyright 2017-Present The THUMT Authors
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+import numpy as np
+import six
+import torch
 
-import tensorflow as tf
-
-
-def load_vocabulary(filename):
-    vocab = []
-    with tf.gfile.GFile(filename) as fd:
-        for line in fd:
-            word = line.strip()
-            vocab.append(word)
-
-    return vocab
+from typing import Union
 
 
-def process_vocabulary(vocab, params):
-    if params.append_eos:
-        vocab.append(params.eos)
+class Vocabulary(object):
 
-    return vocab
+    def __init__(self, filename):
+        self._idx2word = {}
+        self._word2idx = {}
+        cnt = 0
 
+        with open(filename, "rb") as fd:
+            for line in fd:
+                self._word2idx[line.strip()] = cnt
+                self._idx2word[cnt] = line.strip()
+                cnt = cnt + 1
 
-def get_control_mapping(vocab, symbols):
-    mapping = {}
+    def __getitem__(self, key: Union[bytes, int]):
+        if isinstance(key, int):
+            return self._idx2word[key]
+        elif isinstance(key, bytes):
+            return self._word2idx[key]
+        elif isinstance(key, str):
+            key = key.encode("utf-8")
+            return self._word2idx[key]
+        else:
+            raise LookupError("Cannot lookup key %s." % key)
 
-    for i, token in enumerate(vocab):
-        for symbol in symbols:
-            if symbol == token:
-                mapping[symbol] = i
+    def __contains__(self, key):
+        if isinstance(key, str):
+            key = key.encode("utf-8")
 
-    return mapping
+        return key in self._word2idx
+
+    def __iter__(self):
+        return six.iterkeys(self._word2idx)
+
+    def __len__(self):
+        return len(self._idx2word)
